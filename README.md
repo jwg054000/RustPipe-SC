@@ -73,31 +73,17 @@ Without the `hdf5` feature, CSV input is still supported.
 
 Published image: `ghcr.io/jwg054000/rustpipe-sc` (linux/amd64, HDF5 enabled).
 
-**Digest-pin.** Downstream pipelines must `docker pull` a digest-pinned reference. They must **never** `docker build` this tree, never vendor this repo, and never compile rustpipe-sc inside prairie-rna-stream.
+**Digest-pin.** Downstream pipelines must `docker pull` a digest-pinned reference. They must **never** `docker build` this tree, never vendor this repo, and never compile rustpipe-sc inside prairie-rna-stream. GHCR is public; do not float on `latest`. Anonymous `HEAD` without a token redeem still 401 — that is not private.
 
 ```
-ghcr.io/jwg054000/rustpipe-sc:0.3.0@sha256:<digest from the GHCR publish job>
+ghcr.io/jwg054000/rustpipe-sc:0.3.0@sha256:0f7164c538e49c8e8125299fe405e000ad9e9f6aba054142371cffdffbf98e1d
 ```
-
-Do not float on `latest`. The publish workflow writes the digest to the Actions job summary. After the first successful push the package is **private** until made public:
 
 ```bash
-# run publish (after this workflow exists on main)
-gh workflow run publish-ghcr.yml --repo jwg054000/RustPipe-SC
-
-# make the package pullable without a GHCR token
-gh api --method POST -H "Accept: application/vnd.github+json" \
-  /user/packages/container/rustpipe-sc/visibility \
-  -f visibility=public
-```
-
-UI equivalent: [GHCR package settings](https://github.com/users/jwg054000/packages/container/package/rustpipe-sc) → Change visibility → Public.
-
-```bash
-docker pull ghcr.io/jwg054000/rustpipe-sc:0.3.0
+docker pull ghcr.io/jwg054000/rustpipe-sc:0.3.0@sha256:0f7164c538e49c8e8125299fe405e000ad9e9f6aba054142371cffdffbf98e1d
 docker run --rm \
   -v "$PWD/in:/in:ro" -v "$PWD/out:/out" \
-  ghcr.io/jwg054000/rustpipe-sc:0.3.0 \
+  ghcr.io/jwg054000/rustpipe-sc:0.3.0@sha256:0f7164c538e49c8e8125299fe405e000ad9e9f6aba054142371cffdffbf98e1d \
   pipeline --input /in/filtered_feature_bc_matrix.h5 --output /out
 ```
 

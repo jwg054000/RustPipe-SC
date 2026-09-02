@@ -62,17 +62,9 @@ jobs:
           {
             echo "## rustpipe-sc GHCR digest"
             echo ""
-            echo "linux/amd64. Pin this string. Do not float on \`latest\`. Do not \`docker build\` this image inside prairie-rna-stream."
+            echo "linux/amd64. Pin this string. Do not float on \`latest\`. Do not \`docker build\` this image inside prairie-rna-stream. GHCR is public; anonymous HEAD 401 is not private."
             echo ""
             echo '```'
             echo "${IMAGE}:0.3.0@${{ steps.build.outputs.digest }}"
-            echo '```'
-            echo ""
-            echo "First package from GITHUB_TOKEN is private. Make it public:"
-            echo ""
-            echo '```'
-            echo "gh api --method POST -H 'Accept: application/vnd.github+json' \\"
-            echo "  /user/packages/container/rustpipe-sc/visibility \\"
-            echo "  -f visibility=public"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

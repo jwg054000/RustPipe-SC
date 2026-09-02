@@ -54,7 +54,7 @@ No hashed `run.json` yet. `pipeline_timings.json` is the provenance file. A Prai
 Pull the published linux/amd64 image. Never `docker build` this tree from prairie-rna-stream.
 
 ```
-ghcr.io/jwg054000/rustpipe-sc:0.3.0@sha256:<digest from the GHCR publish job summary>
+ghcr.io/jwg054000/rustpipe-sc:0.3.0@sha256:0f7164c538e49c8e8125299fe405e000ad9e9f6aba054142371cffdffbf98e1d
 ```
 
-Until the first successful publish + public visibility click, that digest does not exist. See README (Container).
+GHCR is public. See README (Container).
