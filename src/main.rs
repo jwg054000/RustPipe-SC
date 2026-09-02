@@ -18,6 +18,7 @@ mod graph;
 mod gsea;
 mod h5ad;
 mod hvg_sc;
+mod input_guard;
 mod io;
 mod knn;
 mod leiden;
@@ -790,6 +791,7 @@ fn run_leiden(input: &str, resolution: f64, n_iterations: usize, output: &str) -
 
 fn run_load(input: &str, gene: Option<&str>) -> Result<()> {
     let t0 = Instant::now();
+    input_guard::reject_wrong_assay(std::path::Path::new(input))?;
     let (gene_names, sample_names, data, n_genes, n_samples) =
         io::read_expression_matrix(input).map_err(|e| anyhow::anyhow!("{}", e))?;
 
@@ -823,6 +825,7 @@ fn run_load(input: &str, gene: Option<&str>) -> Result<()> {
 /// - .csv: check if first column header looks like gene names (genes x cells)
 ///   or cell barcodes (cells x genes)
 fn load_input(path: &str) -> Result<(sparse::SpMat, Vec<String>, Vec<String>)> {
+    input_guard::reject_wrong_assay(std::path::Path::new(path))?;
     if path.ends_with(".h5ad") || path.ends_with(".h5") {
         // Auto-detect H5AD vs 10x CellRanger H5 format
         let (mat, obs, var) = h5ad::read_h5_auto(std::path::Path::new(path))?;

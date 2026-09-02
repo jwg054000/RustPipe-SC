@@ -2,7 +2,9 @@
 
 Fast single-cell and spatial transcriptomics in Rust. Accelerates the compute-bound steps of scRNA-seq analysis (QC, normalization, HVG, PCA, kNN, Leiden clustering, marker detection) while maintaining concordance with Scanpy.
 
-Designed to run downstream of [Seqera](https://seqera.io/) / [nf-core/scrnaseq](https://nf-co.re/scrnaseq) pipelines that output H5AD or 10x CellRanger H5 files.
+Designed to run **downstream** of [Cell Ranger](https://www.10xgenomics.com/support/software/cell-ranger) or [nf-core/scrnaseq](https://nf-co.re/scrnaseq) (H5AD or 10x Cell Ranger H5). This crate is **not** a Cell Ranger replacement (no BCL → FASTQ, no barcode/UMI counting). Bulk RNA (STAR → rustqc → rustpipe) lives in [prairie-rna-stream](https://github.com/jwg054000/prairie-rna-stream); never vendor this repo there.
+
+Ingest contract: [`PACKET.md`](PACKET.md).
 
 ## Performance
 
@@ -51,6 +53,8 @@ At 10K cells, RustPipe-SC achieves **22x speedup** over Scanpy on compute-bound 
 
 Auto-detection: `.h5` and `.h5ad` files are automatically detected as 10x or AnnData format.
 
+**Fail-closed.** `--input` must be a cell-count matrix. A bulk STAR BAM, Cell Ranger BAM, rustqc featureCounts TSV, or MTX directory is rejected (see [`PACKET.md`](PACKET.md)). A Cell Ranger BAM is optional `--qc-bam` only.
+
 ### HDF5 Support
 
 H5AD and 10x H5 reading requires the `hdf5` feature and a system HDF5 library:
@@ -64,6 +68,40 @@ HDF5_DIR=$(brew --prefix hdf5) cargo build --release --features hdf5
 ```
 
 Without the `hdf5` feature, CSV input is still supported.
+
+## Container (GHCR)
+
+Published image: `ghcr.io/jwg054000/rustpipe-sc` (linux/amd64, HDF5 enabled).
+
+**Digest-pin.** Downstream pipelines must `docker pull` a digest-pinned reference. They must **never** `docker build` this tree, never vendor this repo, and never compile rustpipe-sc inside prairie-rna-stream.
+
+```
+ghcr.io/jwg054000/rustpipe-sc:0.3.0@sha256:<digest from the GHCR publish job>
+```
+
+Do not float on `latest`. The publish workflow writes the digest to the Actions job summary. After the first successful push the package is **private** until made public:
+
+```bash
+# run publish (after this workflow exists on main)
+gh workflow run publish-ghcr.yml --repo jwg054000/RustPipe-SC
+
+# make the package pullable without a GHCR token
+gh api --method POST -H "Accept: application/vnd.github+json" \
+  /user/packages/container/rustpipe-sc/visibility \
+  -f visibility=public
+```
+
+UI equivalent: [GHCR package settings](https://github.com/users/jwg054000/packages/container/package/rustpipe-sc) → Change visibility → Public.
+
+```bash
+docker pull ghcr.io/jwg054000/rustpipe-sc:0.3.0
+docker run --rm \
+  -v "$PWD/in:/in:ro" -v "$PWD/out:/out" \
+  ghcr.io/jwg054000/rustpipe-sc:0.3.0 \
+  pipeline --input /in/filtered_feature_bc_matrix.h5 --output /out
+```
+
+The image `ENTRYPOINT` is `rustpipe-sc`. Nextflow must override the entrypoint/shell the same way it does for rustpipe.
 
 ## Installation
 
@@ -146,18 +184,17 @@ rustpipe-sc morans-i \
 
 ## Pipeline Outputs
 
+Canonical list and column names: [`PACKET.md`](PACKET.md). `pipeline` writes:
+
 ```
 output/
-  qc_metrics.csv          # Per-cell QC: n_genes, total_counts, pct_mt
-  filtered_cells.csv      # Cells passing QC
-  normalized.csv          # Library-size normalized, log1p transformed
+  qc_metrics.csv          # Per-cell QC: barcode, n_genes_by_counts, total_counts, pct_counts_mt
   hvg_genes.csv           # Selected highly variable genes
-  pca_scores.csv          # PCA embeddings (cells x PCs)
-  pca_loadings.csv        # Gene loadings per PC
-  pca_variance.csv        # Variance explained per PC
+  pca_scores.csv          # PCA embeddings (sample=barcode, PC1…PCk)
   knn.csv                 # k-nearest neighbor graph
   clusters.csv            # Leiden cluster assignments
   markers.csv             # Cluster marker genes (Wilcoxon rank-sum)
+  pipeline_timings.json   # Provenance + step timings
   libqc/                  # Optional: rustqc rna outputs (--qc-bam). Ignore featurecounts/ as cells.
 ```
 
@@ -166,6 +203,7 @@ output/
 ```
 src/
   main.rs       CLI + pipeline orchestration
+  input_guard.rs Fail-closed: reject STAR BAM / featureCounts as --input
   h5ad.rs       H5AD and 10x H5 I/O (feature-gated)
   io.rs         CSV I/O
   sparse.rs     CSR sparse matrix ops, implicit-centering matmul
