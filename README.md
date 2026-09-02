@@ -76,14 +76,14 @@ Published image: `ghcr.io/jwg054000/rustpipe-sc` (linux/amd64, HDF5 enabled).
 **Digest-pin.** Downstream pipelines must `docker pull` a digest-pinned reference. They must **never** `docker build` this tree, never vendor this repo, and never compile rustpipe-sc inside prairie-rna-stream. GHCR is public; do not float on `latest`. Anonymous `HEAD` without a token redeem still 401 — that is not private.
 
 ```
-ghcr.io/jwg054000/rustpipe-sc:0.3.0@sha256:0f7164c538e49c8e8125299fe405e000ad9e9f6aba054142371cffdffbf98e1d
+ghcr.io/jwg054000/rustpipe-sc:0.3.0@sha256:c1d9cc7581ac521e1dae5aae6ac2a63d457c822c4ddcc8507e457d44a21dc8c2
 ```
 
 ```bash
-docker pull ghcr.io/jwg054000/rustpipe-sc:0.3.0@sha256:0f7164c538e49c8e8125299fe405e000ad9e9f6aba054142371cffdffbf98e1d
+docker pull ghcr.io/jwg054000/rustpipe-sc:0.3.0@sha256:c1d9cc7581ac521e1dae5aae6ac2a63d457c822c4ddcc8507e457d44a21dc8c2
 docker run --rm \
   -v "$PWD/in:/in:ro" -v "$PWD/out:/out" \
-  ghcr.io/jwg054000/rustpipe-sc:0.3.0@sha256:0f7164c538e49c8e8125299fe405e000ad9e9f6aba054142371cffdffbf98e1d \
+  ghcr.io/jwg054000/rustpipe-sc:0.3.0@sha256:c1d9cc7581ac521e1dae5aae6ac2a63d457c822c4ddcc8507e457d44a21dc8c2 \
   pipeline --input /in/filtered_feature_bc_matrix.h5 --output /out
 ```
 
