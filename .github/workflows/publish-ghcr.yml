@@ -3,7 +3,11 @@ name: Publish GHCR
 on:
   push:
     branches: [main]
-    tags: ['v*']
+    paths:
+      - Dockerfile
+      - Cargo.toml
+      - Cargo.lock
+      - src/**
   workflow_dispatch:
 
 permissions:

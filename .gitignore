@@ -26,3 +26,4 @@ results_scaling_bench.json
 # Test data
 /data/
 .claude/
+overnight-smoke/
