@@ -21,6 +21,7 @@ mod hvg_sc;
 mod io;
 mod knn;
 mod leiden;
+mod libqc;
 mod markers;
 mod morans_i;
 mod normalize;
@@ -117,6 +118,7 @@ enum Commands {
         /// HVG selection flavor: "seurat" (dispersion-bin) or "seurat_v3" (VST)
         #[arg(long, default_value = "seurat")]
         hvg_flavor: String,
+
     },
 
     /// PCA on expression data (dense or sparse)
@@ -221,6 +223,14 @@ enum Commands {
         /// HVG selection flavor: "seurat" (dispersion-bin) or "seurat_v3" (VST)
         #[arg(long, default_value = "seurat")]
         hvg_flavor: String,
+
+        /// Optional Cell Ranger BAM for Seqera rustqc library QC (writes output/libqc/)
+        #[arg(long, requires = "qc_gtf")]
+        qc_bam: Option<String>,
+
+        /// GTF for rustqc when --qc-bam is set
+        #[arg(long)]
+        qc_gtf: Option<String>,
     },
 
     /// Run GSEA on ranked gene list
@@ -333,6 +343,8 @@ fn main() {
             max_value,
             skip_normalize,
             hvg_flavor,
+            qc_bam,
+            qc_gtf,
         } => run_pipeline(
             &input,
             &output,
@@ -345,6 +357,8 @@ fn main() {
             skip_normalize,
             &hvg_flavor,
             cli.seed,
+            qc_bam.as_deref(),
+            qc_gtf.as_deref(),
         ),
 
         Commands::Gsea {
@@ -557,12 +571,27 @@ fn run_pipeline(
     skip_normalize: bool,
     hvg_flavor: &str,
     seed: u64,
+    qc_bam: Option<&str>,
+    qc_gtf: Option<&str>,
 ) -> Result<()> {
     let pipeline_t0 = Instant::now();
     std::fs::create_dir_all(output)?;
     let out_path = std::path::Path::new(output);
 
     let mut timings: Vec<(&str, f64)> = Vec::new();
+
+    if let Some(bam) = qc_bam {
+        let gtf = qc_gtf.ok_or_else(|| {
+            anyhow::anyhow!("--qc-gtf is required when --qc-bam is set")
+        })?;
+        let t0 = Instant::now();
+        libqc::run_libqc(
+            std::path::Path::new(bam),
+            std::path::Path::new(gtf),
+            out_path,
+        )?;
+        timings.push(("libqc", t0.elapsed().as_secs_f64()));
+    }
 
     // Step 1: Load
     let t0 = Instant::now();
