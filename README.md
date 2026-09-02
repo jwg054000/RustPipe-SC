@@ -99,6 +99,13 @@ rustpipe-sc pipeline \
 rustpipe-sc pipeline \
   --input expression.csv \
   --output results/
+
+# Optional library QC from a Cell Ranger BAM (PATH rustqc; not the cell matrix)
+rustpipe-sc pipeline \
+  --input filtered_feature_bc_matrix.h5 \
+  --output results/ \
+  --qc-bam possorted_genome_bam.bam \
+  --qc-gtf genes.gtf
 ```
 
 ### Individual Steps
@@ -151,6 +158,7 @@ output/
   knn.csv                 # k-nearest neighbor graph
   clusters.csv            # Leiden cluster assignments
   markers.csv             # Cluster marker genes (Wilcoxon rank-sum)
+  libqc/                  # Optional: rustqc rna outputs (--qc-bam). Ignore featurecounts/ as cells.
 ```
 
 ## Architecture
@@ -173,6 +181,7 @@ src/
   morans_i.rs   Moran's I spatial autocorrelation
   gsea.rs       Gene set enrichment analysis
   stats_sc.rs   Statistical utilities (Welford, BH, MAD)
+  libqc.rs      Optional Seqera rustqc BAM library QC sidecar
 ```
 
 ## Seqera Integration
@@ -184,7 +193,10 @@ nf-core/scrnaseq (cellranger/alevin/starsolo)
   --> filtered_feature_bc_matrix.h5  (10x format)
   --> adata.h5ad                      (AnnData format)
       --> rustpipe-sc pipeline --input adata.h5ad --output results/
+          [--qc-bam possorted_genome_bam.bam --qc-gtf genes.gtf]
 ```
+
+`--qc-bam` is off by default. When set, rustpipe-sc runs PATH `rustqc rna` into `output/libqc/` with `--skip-dup-check` (Cell Ranger BAMs are usually not Picard-markdup). Do not pass `--paired`. Any `libqc/featurecounts/` table is library QC only and is never the cell-count matrix. Install [Seqera RustQC](https://github.com/seqeralabs/RustQC) on PATH (or set `RUSTPIPE_SC_RUSTQC`); it is not vendored.
 
 ## Testing
 
