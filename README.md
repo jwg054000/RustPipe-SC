@@ -225,9 +225,13 @@ nf-core/scrnaseq (cellranger/alevin/starsolo)
 ## Testing
 
 ```bash
-cargo test                    # 104 unit tests, ~0.06s
-cargo test --features hdf5    # Includes H5AD I/O tests (requires HDF5)
+cargo test                    # unit tests, CSV + fail-closed (no HDF5)
+cargo test --features hdf5    # + 10x H5 fixture through `pipeline` (needs libhdf5)
 ```
+
+CI installs `libhdf5-dev` and runs default `rustpipe-sc pipeline` on
+`testdata/filtered_feature_bc_matrix.h5` (synthetic Cell Ranger `/matrix`,
+not a public PBMC file). That job must write the PACKET.md artifacts.
 
 ## Known Limitations
 
