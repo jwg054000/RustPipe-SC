@@ -16,3 +16,28 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Test (CSV + fail-closed; no HDF5)
         run: cargo test
+
+      - name: Install HDF5
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libhdf5-dev pkg-config
+
+      - name: Test (HDF5 + 10x fixture pipeline)
+        run: cargo test --features hdf5
+
+      - name: Pipeline H5 fixture writes PACKET.md artifacts
+        run: |
+          cargo build --features hdf5
+          ./target/debug/rustpipe-sc pipeline \
+            --input testdata/filtered_feature_bc_matrix.h5 \
+            --output packet-out
+          test -s packet-out/qc_metrics.csv
+          test -s packet-out/pca_scores.csv
+          test -s packet-out/clusters.csv
+          test -s packet-out/markers.csv
+          test -s packet-out/pipeline_timings.json
+          grep -q '"pipeline": "rustpipe-sc"' packet-out/pipeline_timings.json
+
+      - name: Upload PACKET artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: packet
+          path: packet-out/
