@@ -616,6 +616,16 @@ fn run_pipeline(
     let kept_var: Vec<String> = kept_genes.iter().map(|&i| var_names[i].clone()).collect();
     timings.push(("qc_filter", t0.elapsed().as_secs_f64()));
     eprintln!("[pipeline] QC: {} cells, {} genes", n_kept, kept_var.len());
+    if n_kept < 2 {
+        anyhow::bail!(
+            "too few cells after QC ({n_kept}); lower --min-genes or raise --max-pct-mt (default 5.0)"
+        );
+    }
+    if n_kept < 100 {
+        eprintln!(
+            "[pipeline] WARN: only {n_kept} cells after QC; default --max-pct-mt 5.0 is tight on some 10x H5s"
+        );
+    }
 
     // Step 3: Normalize (skip if input is already normalized)
     let normed = if skip_normalize {
@@ -667,6 +677,10 @@ fn run_pipeline(
     );
 
     // Step 6: PCA (on scaled dense matrix)
+    let n_pcs = n_pcs
+        .min(n_kept.saturating_sub(1))
+        .min(scaled.ncols().saturating_sub(1))
+        .max(1);
     let t0 = Instant::now();
     let pca_result = pca::run_pca_scaled(
         &scaled,

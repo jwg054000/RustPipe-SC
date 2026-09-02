@@ -582,7 +582,11 @@ pub fn run_pca_sparse(
     let total_t0 = Instant::now();
     let n_cells = mat.rows();
     let n_genes = mat.cols();
-    let k = n_components + oversampling;
+    let n_components = n_components
+        .min(n_cells.saturating_sub(1))
+        .min(n_genes.saturating_sub(1))
+        .max(1);
+    let k = (n_components + oversampling).min(n_genes).min(n_cells);
 
     eprintln!(
         "[pca-sparse] {}x{} matrix, {} components, {} power iterations",
@@ -626,6 +630,7 @@ pub fn run_pca_sparse(
 
     // Convert to f64 flat for small_svd (reuse existing dense SVD)
     let k_actual = k.min(n_genes).min(n_cells);
+    let n_components = n_components.min(k_actual).max(1);
     let mut b_flat = vec![0.0f64; k_actual * n_genes];
     for i in 0..k_actual {
         for j in 0..n_genes {
@@ -735,6 +740,10 @@ pub fn run_pca_scaled(
     let total_t0 = Instant::now();
     let n_cells = scaled.nrows();
     let n_genes = scaled.ncols();
+    let n_components = n_components
+        .min(n_cells.saturating_sub(1))
+        .min(n_genes.saturating_sub(1))
+        .max(1);
     let k = (n_components + oversampling).min(n_genes).min(n_cells);
 
     eprintln!(
@@ -778,6 +787,7 @@ pub fn run_pca_scaled(
 
     // Convert to f64 flat for small_svd
     let k_actual = k.min(n_genes).min(n_cells);
+    let n_components = n_components.min(k_actual).max(1);
     let mut b_flat = vec![0.0f64; k_actual * n_genes];
     for i in 0..k_actual {
         for j in 0..n_genes {
