@@ -25,12 +25,10 @@ use crate::sparse::SpMat;
 /// * `scaled` - dense cells x genes Array2<f32>
 /// * `means` - per-gene population means (length n_genes)
 /// * `stds` - per-gene population stds (length n_genes)
-pub fn scale_sparse(mat: &SpMat, max_value: f32) -> (Array2<f32>, Vec<f32>, Vec<f32>) {
+/// Per-gene population mean and std (ddof=0), without densifying.
+pub fn scale_stats(mat: &SpMat) -> (Vec<f32>, Vec<f32>) {
     let n_cells = mat.rows();
     let n_genes = mat.cols();
-
-    // Step 1: Compute per-gene sum and sum-of-squares from sparse data.
-    // Use population statistics (ddof=0) to match Scanpy.
     let mut sums = vec![0.0f64; n_genes];
     let mut sum_sq = vec![0.0f64; n_genes];
 
@@ -50,13 +48,18 @@ pub fn scale_sparse(mat: &SpMat, max_value: f32) -> (Array2<f32>, Vec<f32>, Vec<
         .zip(sum_sq.iter())
         .map(|(&s, &sq)| {
             let mean = s / n;
-            // Population variance: E[x^2] - E[x]^2
             let var = (sq / n) - mean * mean;
             let std = var.max(0.0).sqrt();
-            // Floor at 1e-12 to avoid division by zero
             std.max(1e-12) as f32
         })
         .collect();
+    (means, stds)
+}
+
+pub fn scale_sparse(mat: &SpMat, max_value: f32) -> (Array2<f32>, Vec<f32>, Vec<f32>) {
+    let n_cells = mat.rows();
+    let n_genes = mat.cols();
+    let (means, stds) = scale_stats(mat);
 
     // Step 2: Build dense scaled matrix.
     // Most entries are zero in the sparse matrix, so we first fill the entire

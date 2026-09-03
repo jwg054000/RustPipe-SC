@@ -42,7 +42,7 @@ What this crate actually writes today (v0.3.0). Column names are as emitted; do 
 | `knn.csv` | `neighbor_1`,`distance_1`,… for k neighbors |
 | `clusters.csv` | `barcode`, `cluster` |
 | `markers.csv` | `cluster`, `gene`, `score`, `pval`, `pval_adj`, `log2fc` |
-| `pipeline_timings.json` | `pipeline`=`rustpipe-sc`, `version`, `seed`, `input`, cell/gene counts, `hvg_flavor`, `n_pcs`, `knn_k`, `steps[{step,seconds}]`, `total_seconds` |
+| `pipeline_timings.json` | `pipeline`=`rustpipe-sc`, `version`, `seed`, `input`, cell/gene counts, `hvg_flavor`, `n_pcs`, `knn_k`, `steps[{step,seconds}]`, `total_seconds`. Step names are unchanged (`load`, `qc_filter`, `normalize`, `hvg`, `scale`, `pca`, `knn`, `leiden`, `markers`). Internally QC+normalize+HVG share two CSR nnz passes; `scale` is mean/std only (z-score+clip is implicit in PCA). |
 | `libqc/` | only if `--qc-bam`; rustqc tree. Not the cell matrix. |
 
 The `qc` subcommand also writes `filtered_barcodes.csv`. The full `pipeline` subcommand does **not** write `filtered_cells.csv` / `normalized.csv` / `pca_loadings.csv` (those names in older README lists are not produced).

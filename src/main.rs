@@ -14,6 +14,7 @@
     clippy::doc_overindented_list_items
 )]
 
+mod fused;
 mod graph;
 mod gsea;
 mod h5ad;
@@ -119,7 +120,6 @@ enum Commands {
         /// HVG selection flavor: "seurat" (dispersion-bin) or "seurat_v3" (VST)
         #[arg(long, default_value = "seurat")]
         hvg_flavor: String,
-
     },
 
     /// PCA on expression data (dense or sparse)
@@ -582,9 +582,8 @@ fn run_pipeline(
     let mut timings: Vec<(&str, f64)> = Vec::new();
 
     if let Some(bam) = qc_bam {
-        let gtf = qc_gtf.ok_or_else(|| {
-            anyhow::anyhow!("--qc-gtf is required when --qc-bam is set")
-        })?;
+        let gtf =
+            qc_gtf.ok_or_else(|| anyhow::anyhow!("--qc-gtf is required when --qc-bam is set"))?;
         let t0 = Instant::now();
         libqc::run_libqc(
             std::path::Path::new(bam),
@@ -604,16 +603,26 @@ fn run_pipeline(
         mat.cols()
     );
 
-    // Step 2: QC
+    // Steps 2–4: two CSR nnz passes (QC+gene counts, then normalize+HVG stats).
+    // pipeline_timings.json keeps qc_filter / normalize / hvg.
     let t0 = Instant::now();
-    let metrics = qc::compute_qc_metrics(&mat, &var_names, &obs_names);
+    let (metrics, keep_cells, gene_counts) =
+        qc::qc_metrics_and_kept_gene_counts(&mat, &var_names, &obs_names, min_genes, max_pct_mt);
     qc::write_qc_csv(&metrics, &out_path.join("qc_metrics.csv"))?;
-
-    let keep = qc::filter_cells_fixed(&metrics, min_genes, max_pct_mt);
-    let n_kept = keep.iter().filter(|&&b| b).count();
-    let (filtered_mat, filtered_names) = qc::apply_cell_filter(&mat, &obs_names, &keep);
-    let (gene_filtered, kept_genes) = qc::filter_genes(&filtered_mat, 3);
-    let kept_var: Vec<String> = kept_genes.iter().map(|&i| var_names[i].clone()).collect();
+    let keep_genes = qc::gene_keep_from_counts(&gene_counts, 3);
+    let filtered_names: Vec<String> = obs_names
+        .iter()
+        .zip(keep_cells.iter())
+        .filter(|(_, &k)| k)
+        .map(|(n, _)| n.clone())
+        .collect();
+    let kept_var: Vec<String> = var_names
+        .iter()
+        .zip(keep_genes.iter())
+        .filter(|(_, &k)| k)
+        .map(|(n, _)| n.clone())
+        .collect();
+    let n_kept = filtered_names.len();
     timings.push(("qc_filter", t0.elapsed().as_secs_f64()));
     eprintln!("[pipeline] QC: {} cells, {} genes", n_kept, kept_var.len());
     if n_kept < 2 {
@@ -627,23 +636,37 @@ fn run_pipeline(
         );
     }
 
-    // Step 3: Normalize (skip if input is already normalized)
-    let normed = if skip_normalize {
+    let t0 = Instant::now();
+    let (normed, gene_means, gene_variances) = normalize::normalize_log1p_subset_with_stats(
+        &mat,
+        &keep_cells,
+        &keep_genes,
+        1e4,
+        skip_normalize,
+    );
+    if skip_normalize {
         eprintln!("[pipeline] skipping normalization (--skip-normalize)");
-        gene_filtered
     } else {
-        let t0 = Instant::now();
-        let n = normalize::normalize_log1p_sparse(&gene_filtered, 1e4);
-        timings.push(("normalize", t0.elapsed().as_secs_f64()));
-        eprintln!("[pipeline] normalized, nnz={}", n.nnz());
-        n
-    };
+        eprintln!("[pipeline] normalized, nnz={}", normed.nnz());
+    }
+    timings.push(("normalize", t0.elapsed().as_secs_f64()));
 
-    // Step 4: HVG selection
     let t0 = Instant::now();
     let hvg_result = match hvg_flavor {
-        "seurat_v3" => hvg_sc::select_hvg_sparse(&normed, &kept_var, n_hvg)?,
-        _ => hvg_sc::select_hvg_seurat(&normed, &kept_var, n_hvg, 20)?,
+        "seurat_v3" => hvg_sc::select_hvg_vst_from_stats(
+            &gene_means,
+            &gene_variances,
+            &kept_var,
+            n_hvg,
+            normed.rows(),
+        )?,
+        _ => hvg_sc::select_hvg_seurat_from_stats(
+            &gene_means,
+            &gene_variances,
+            &kept_var,
+            n_hvg,
+            20,
+        )?,
     };
     let hvg_mat = sparse::subset_genes(&normed, &hvg_result.gene_indices);
     timings.push(("hvg", t0.elapsed().as_secs_f64()));
@@ -665,25 +688,25 @@ fn run_pipeline(
         eprintln!("[pipeline] wrote {}", hvg_path.display());
     }
 
-    // Step 5: Scale (z-score normalization with clipping)
+    // Step 5: Scale stats only (no densify). Clip/z-score applied in PCA matmuls.
     let t0 = Instant::now();
-    let (scaled, _means, _stds) = scale::scale_sparse(&hvg_mat, max_value);
+    let (scale_means, scale_stds) = scale::scale_stats(&hvg_mat);
     timings.push(("scale", t0.elapsed().as_secs_f64()));
     eprintln!(
-        "[pipeline] scaled: {} x {}, max_value={}",
-        scaled.nrows(),
-        scaled.ncols(),
+        "[pipeline] scale stats: {} cells x {} HVG, max_value={} (implicit, not densified)",
+        hvg_mat.rows(),
+        hvg_mat.cols(),
         max_value
     );
 
-    // Step 6: PCA (on scaled dense matrix)
-    let n_pcs = n_pcs
-        .min(n_kept.saturating_sub(1))
-        .min(scaled.ncols().saturating_sub(1))
-        .max(1);
+    // Step 6: PCA — power-iteration RSVD with implicit scale+clip+center
+    let n_pcs = sparse::clamp_n_pcs(n_pcs, n_kept, hvg_mat.cols());
     let t0 = Instant::now();
-    let pca_result = pca::run_pca_scaled(
-        &scaled,
+    let pca_result = pca::run_pca_sparse_scaled(
+        &hvg_mat,
+        &scale_means,
+        &scale_stds,
+        max_value,
         &hvg_result.gene_names,
         n_pcs,
         3,  // power iterations
@@ -866,5 +889,108 @@ fn load_input(path: &str) -> Result<(sparse::SpMat, Vec<String>, Vec<String>)> {
                 io::read_sparse_csv(path).map_err(|e| anyhow::anyhow!("Failed to load: {}", e))?;
             Ok(result)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_toy_cells_csv(path: &std::path::Path, n_cells: usize, n_genes: usize) {
+        let mut f = std::fs::File::create(path).unwrap();
+        write!(f, "barcode").unwrap();
+        for g in 0..n_genes {
+            write!(f, ",G{g:02}").unwrap();
+        }
+        writeln!(f).unwrap();
+        for c in 0..n_cells {
+            write!(f, "CELL{c:03}").unwrap();
+            for g in 0..n_genes {
+                // Deterministic sparse-ish counts; every cell expresses enough genes.
+                let v = if (c + g) % 4 == 0 {
+                    0.0
+                } else {
+                    ((c * 7 + g * 13) % 40) as f32 + 2.0
+                };
+                write!(f, ",{v}").unwrap();
+            }
+            writeln!(f).unwrap();
+        }
+    }
+
+    #[test]
+    fn pipeline_writes_packet_artifacts_and_timing_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("counts.csv");
+        write_toy_cells_csv(&csv, 40, 30);
+        let out = dir.path().join("out");
+
+        run_pipeline(
+            csv.to_str().unwrap(),
+            out.to_str().unwrap(),
+            8,
+            50,
+            5,
+            1,
+            100.0,
+            10.0,
+            false,
+            "seurat",
+            42,
+            None,
+            None,
+        )
+        .unwrap();
+
+        for name in [
+            "qc_metrics.csv",
+            "hvg_genes.csv",
+            "pca_scores.csv",
+            "knn.csv",
+            "clusters.csv",
+            "markers.csv",
+            "pipeline_timings.json",
+        ] {
+            assert!(out.join(name).is_file(), "missing packet artifact {name}");
+        }
+
+        let timings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(out.join("pipeline_timings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(timings["pipeline"], "rustpipe-sc");
+        let steps: Vec<String> = timings["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["step"].as_str().unwrap().to_string())
+            .collect();
+        for expected in [
+            "load",
+            "qc_filter",
+            "normalize",
+            "hvg",
+            "scale",
+            "pca",
+            "knn",
+            "leiden",
+            "markers",
+        ] {
+            assert!(
+                steps.iter().any(|s| s == expected),
+                "missing timing step {expected} in {steps:?}"
+            );
+        }
+
+        let pca_header = std::fs::read_to_string(out.join("pca_scores.csv"))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        // 40 cells, 8 HVG, request 50 → clamp to min(50, 39, 8) = 8
+        assert!(pca_header.contains("PC8"));
+        assert!(!pca_header.contains("PC9"));
     }
 }

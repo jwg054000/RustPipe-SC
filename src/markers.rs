@@ -141,11 +141,71 @@ fn extract_gene_columns(mat: &SpMat) -> Vec<Vec<f32>> {
     columns
 }
 
+fn score_cluster(
+    cluster_id: usize,
+    gene_columns: &[Vec<f32>],
+    clusters: &[usize],
+    var_names: &[String],
+) -> MarkerResult {
+    let n_cells = clusters.len();
+    let n_genes = gene_columns.len();
+    let is_cluster: Vec<bool> = clusters.iter().map(|&c| c == cluster_id).collect();
+    let n_in = is_cluster.iter().filter(|&&b| b).count();
+    let n_out = n_cells - n_in;
+
+    let mut scores = Vec::with_capacity(n_genes);
+    let mut pvals = Vec::with_capacity(n_genes);
+    let mut log2fcs = Vec::with_capacity(n_genes);
+
+    for g in 0..n_genes {
+        let vals = &gene_columns[g];
+        let (score, pval) = wilcoxon_rank_sum(vals, &is_cluster);
+
+        let mean_in: f64 = vals
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| is_cluster[*i])
+            .map(|(_, &v)| v as f64)
+            .sum::<f64>()
+            / n_in.max(1) as f64;
+        let mean_out: f64 = vals
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !is_cluster[*i])
+            .map(|(_, &v)| v as f64)
+            .sum::<f64>()
+            / n_out.max(1) as f64;
+
+        let log2fc = if mean_out > 1e-10 {
+            (mean_in / mean_out).log2()
+        } else if mean_in > 1e-10 {
+            10.0
+        } else {
+            0.0
+        };
+
+        scores.push(score);
+        pvals.push(pval);
+        log2fcs.push(log2fc);
+    }
+
+    let mut pvals_adj = pvals.clone();
+    stats_sc::bh_adjust(&mut pvals_adj);
+
+    MarkerResult {
+        cluster_id,
+        gene_names: var_names.to_vec(),
+        scores,
+        pvals,
+        pvals_adj,
+        log2fc: log2fcs,
+    }
+}
+
 /// Compute marker genes for all clusters via Wilcoxon rank-sum test.
 ///
-/// Operates on normalized (log1p) expression in sparse format. For each
-/// cluster, tests every gene for differential expression between cells
-/// in the cluster vs all other cells.
+/// One cluster per rayon task. Ranking is deterministic (no RNG): same
+/// top-N genes and order as the serial path.
 ///
 /// # Arguments
 /// * `mat` - Sparse CSR matrix (cells x genes), normalized log1p expression
@@ -158,75 +218,38 @@ pub fn find_markers(
     var_names: &[String],
     _n_top: usize,
 ) -> Result<Vec<MarkerResult>> {
-    let n_cells = mat.rows();
-    let n_genes = mat.cols();
-    let n_clusters = *clusters.iter().max().unwrap_or(&0) + 1;
+    find_markers_impl(mat, clusters, var_names, true)
+}
 
-    // Extract all gene columns in a single pass (CSR -> columnar)
+/// Serial Wilcoxon markers (same ranking as `find_markers`; for tests).
+pub fn find_markers_serial(
+    mat: &SpMat,
+    clusters: &[usize],
+    var_names: &[String],
+    _n_top: usize,
+) -> Result<Vec<MarkerResult>> {
+    find_markers_impl(mat, clusters, var_names, false)
+}
+
+fn find_markers_impl(
+    mat: &SpMat,
+    clusters: &[usize],
+    var_names: &[String],
+    parallel: bool,
+) -> Result<Vec<MarkerResult>> {
+    let n_clusters = *clusters.iter().max().unwrap_or(&0) + 1;
     let gene_columns = extract_gene_columns(mat);
 
-    // For each cluster, compute markers with parallel gene iteration
-    let results: Vec<MarkerResult> = (0..n_clusters)
-        .map(|cluster_id| {
-            let is_cluster: Vec<bool> = clusters.iter().map(|&c| c == cluster_id).collect();
-            let n_in = is_cluster.iter().filter(|&&b| b).count();
-            let n_out = n_cells - n_in;
-
-            // Parallel across genes: Wilcoxon test + fold change
-            let gene_results: Vec<(f64, f64, f64)> = (0..n_genes)
-                .into_par_iter()
-                .map(|g| {
-                    let vals = &gene_columns[g];
-
-                    // Wilcoxon rank-sum test
-                    let (score, pval) = wilcoxon_rank_sum(vals, &is_cluster);
-
-                    // Log2 fold change: mean(cluster) / mean(rest)
-                    let mean_in: f64 = vals
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| is_cluster[*i])
-                        .map(|(_, &v)| v as f64)
-                        .sum::<f64>()
-                        / n_in.max(1) as f64;
-                    let mean_out: f64 = vals
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| !is_cluster[*i])
-                        .map(|(_, &v)| v as f64)
-                        .sum::<f64>()
-                        / n_out.max(1) as f64;
-
-                    let log2fc = if mean_out > 1e-10 {
-                        (mean_in / mean_out).log2()
-                    } else if mean_in > 1e-10 {
-                        10.0 // cap when denominator is ~zero
-                    } else {
-                        0.0
-                    };
-
-                    (score, pval, log2fc)
-                })
-                .collect();
-
-            let scores: Vec<f64> = gene_results.iter().map(|r| r.0).collect();
-            let pvals: Vec<f64> = gene_results.iter().map(|r| r.1).collect();
-            let log2fcs: Vec<f64> = gene_results.iter().map(|r| r.2).collect();
-
-            // Benjamini-Hochberg FDR correction
-            let mut pvals_adj = pvals.clone();
-            stats_sc::bh_adjust(&mut pvals_adj);
-
-            MarkerResult {
-                cluster_id,
-                gene_names: var_names.to_vec(),
-                scores,
-                pvals,
-                pvals_adj,
-                log2fc: log2fcs,
-            }
-        })
-        .collect();
+    let results = if parallel {
+        (0..n_clusters)
+            .into_par_iter()
+            .map(|cluster_id| score_cluster(cluster_id, &gene_columns, clusters, var_names))
+            .collect()
+    } else {
+        (0..n_clusters)
+            .map(|cluster_id| score_cluster(cluster_id, &gene_columns, clusters, var_names))
+            .collect()
+    };
 
     Ok(results)
 }
@@ -495,5 +518,66 @@ mod tests {
         assert_eq!(cols[0], vec![1.0, 0.0, 3.0]);
         // Gene 1: [0, 2, 0]
         assert_eq!(cols[1], vec![0.0, 2.0, 0.0]);
+    }
+
+    fn ranked_top_genes(result: &MarkerResult, n_top: usize) -> Vec<String> {
+        let mut indices: Vec<usize> = (0..result.gene_names.len()).collect();
+        indices.sort_by(|&a, &b| {
+            result.pvals_adj[a]
+                .partial_cmp(&result.pvals_adj[b])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(
+                    result.log2fc[b]
+                        .abs()
+                        .partial_cmp(&result.log2fc[a].abs())
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+        });
+        indices
+            .iter()
+            .take(n_top)
+            .map(|&i| result.gene_names[i].clone())
+            .collect()
+    }
+
+    #[test]
+    fn test_find_markers_parallel_matches_serial() {
+        // 12 cells x 5 genes, 3 clusters — small enough to compare bit-stable ranks.
+        let mat = sparse::from_triplets(
+            12,
+            5,
+            &[
+                0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11,
+            ],
+            &[
+                0, 1, 0, 1, 0, 2, 1, 2, 1, 3, 2, 3, 2, 4, 3, 4, 3, 0, 4, 0, 4, 1, 0, 4,
+            ],
+            &[
+                9.0, 1.0, 8.0, 2.0, 10.0, 1.0, 2.0, 8.0, 1.0, 9.0, 2.0, 7.0, 8.0, 1.0, 9.0, 2.0,
+                7.0, 1.0, 10.0, 1.0, 8.0, 2.0, 1.0, 9.0,
+            ],
+        );
+        let clusters = vec![0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2];
+        let names: Vec<String> = (0..5).map(|g| format!("G{g}")).collect();
+
+        let parallel = find_markers(&mat, &clusters, &names, 3).unwrap();
+        let serial = find_markers_serial(&mat, &clusters, &names, 3).unwrap();
+        assert_eq!(parallel.len(), serial.len());
+        for (p, s) in parallel.iter().zip(serial.iter()) {
+            assert_eq!(p.cluster_id, s.cluster_id);
+            assert_eq!(ranked_top_genes(p, 3), ranked_top_genes(s, 3));
+            for i in 0..p.gene_names.len() {
+                assert!((p.scores[i] - s.scores[i]).abs() < 1e-10);
+                assert!((p.pvals[i] - s.pvals[i]).abs() < 1e-12);
+                assert!((p.pvals_adj[i] - s.pvals_adj[i]).abs() < 1e-12);
+                let same_fc =
+                    p.log2fc[i] == s.log2fc[i] || ((p.log2fc[i] - s.log2fc[i]).abs() < 1e-10);
+                assert!(
+                    same_fc,
+                    "log2fc[{}] cluster {} parallel={} serial={}",
+                    i, p.cluster_id, p.log2fc[i], s.log2fc[i]
+                );
+            }
+        }
     }
 }

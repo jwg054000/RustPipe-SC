@@ -50,6 +50,108 @@ pub fn normalize_log1p_sparse(mat: &SpMat, target_sum: f32) -> SpMat {
     CsMat::new((n_cells, n_genes), indptr, indices, data)
 }
 
+/// Pass 2 of the fused prep: subset kept cells/genes, optionally
+/// normalize+log1p, and accumulate per-gene mean/variance.
+///
+/// One scan over kept-cell nonzeros. Cell totals use only kept genes
+/// (same biology as `filter_genes` then `normalize_log1p_sparse`).
+/// Variance uses Bessel correction, matching `sparse_gene_stats`.
+pub fn normalize_log1p_subset_with_stats(
+    mat: &SpMat,
+    keep_cells: &[bool],
+    keep_genes: &[bool],
+    target_sum: f32,
+    skip_normalize: bool,
+) -> (SpMat, Vec<f32>, Vec<f32>) {
+    let n_new_cells = keep_cells.iter().filter(|&&b| b).count();
+    let n_new_genes = keep_genes.iter().filter(|&&b| b).count();
+
+    let mut col_map = vec![None; mat.cols()];
+    let mut new_idx = 0usize;
+    for (orig, &kept) in keep_genes.iter().enumerate() {
+        if kept {
+            col_map[orig] = Some(new_idx);
+            new_idx += 1;
+        }
+    }
+
+    let mut indptr: Vec<usize> = Vec::with_capacity(n_new_cells + 1);
+    let mut indices: Vec<usize> = Vec::with_capacity(mat.nnz());
+    let mut data: Vec<f32> = Vec::with_capacity(mat.nnz());
+    indptr.push(0);
+
+    let mut sums = vec![0.0f64; n_new_genes];
+    let mut sum_sq = vec![0.0f64; n_new_genes];
+
+    for i in 0..mat.rows() {
+        if !keep_cells[i] {
+            continue;
+        }
+        let row = mat.outer_view(i).unwrap();
+
+        if skip_normalize {
+            for (col, &val) in row.iter() {
+                if val > 0.0 {
+                    if let Some(new_col) = col_map[col] {
+                        indices.push(new_col);
+                        data.push(val);
+                        let v = val as f64;
+                        sums[new_col] += v;
+                        sum_sq[new_col] += v * v;
+                    }
+                }
+            }
+        } else {
+            let mut cell_total = 0.0f32;
+            for (col, &val) in row.iter() {
+                if val > 0.0 && keep_genes[col] {
+                    cell_total += val;
+                }
+            }
+            if cell_total > 0.0 {
+                let scale = target_sum / cell_total;
+                for (col, &val) in row.iter() {
+                    if val > 0.0 {
+                        if let Some(new_col) = col_map[col] {
+                            let normalized = (val * scale + 1.0).ln();
+                            if normalized > 0.0 {
+                                indices.push(new_col);
+                                data.push(normalized);
+                                let v = normalized as f64;
+                                sums[new_col] += v;
+                                sum_sq[new_col] += v * v;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        indptr.push(indices.len());
+    }
+
+    let n = n_new_cells as f64;
+    let means: Vec<f32> = if n > 0.0 {
+        sums.iter().map(|&s| (s / n) as f32).collect()
+    } else {
+        vec![0.0; n_new_genes]
+    };
+    let variances: Vec<f32> = if n > 1.0 {
+        sums.iter()
+            .zip(sum_sq.iter())
+            .map(|(&s, &sq)| {
+                let mean = s / n;
+                let var = (sq - n * mean * mean) / (n - 1.0);
+                var.max(0.0) as f32
+            })
+            .collect()
+    } else {
+        vec![0.0; n_new_genes]
+    };
+
+    let out = CsMat::new((n_new_cells, n_new_genes), indptr, indices, data);
+    (out, means, variances)
+}
+
 /// Normalize without log transform (just scale to target_sum per cell).
 /// Builds output CSR directly (no TriMat overhead).
 #[allow(dead_code)]
@@ -150,5 +252,36 @@ mod tests {
         // 100/500 * 10000 = 2000, 400/500 * 10000 = 8000
         assert!((val0 - 2000.0).abs() < 0.1);
         assert!((val1 - 8000.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_subset_with_stats_matches_normalize() {
+        let mat = from_triplets(
+            2,
+            3,
+            &[0, 0, 1, 1],
+            &[0, 2, 0, 1],
+            &[100.0, 200.0, 300.0, 100.0],
+        );
+        let keep_cells = vec![true, true];
+        let keep_genes = vec![true, true, true];
+        let (fused, means, vars) =
+            normalize_log1p_subset_with_stats(&mat, &keep_cells, &keep_genes, 1e4, false);
+        let seq = normalize_log1p_sparse(&mat, 1e4);
+        let (seq_means, seq_vars) = crate::sparse::sparse_gene_stats(&seq, seq.rows());
+
+        assert_eq!(fused.nnz(), seq.nnz());
+        for i in 0..2 {
+            let ra = fused.outer_view(i).unwrap();
+            let rb = seq.outer_view(i).unwrap();
+            for ((c1, &v1), (c2, &v2)) in ra.iter().zip(rb.iter()) {
+                assert_eq!(c1, c2);
+                assert!((v1 - v2).abs() < 1e-6);
+            }
+        }
+        for i in 0..3 {
+            assert!((means[i] - seq_means[i]).abs() < 1e-6);
+            assert!((vars[i] - seq_vars[i]).abs() < 1e-5);
+        }
     }
 }

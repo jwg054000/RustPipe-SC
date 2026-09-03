@@ -65,6 +65,82 @@ pub fn compute_qc_metrics(mat: &SpMat, var_names: &[String], obs_names: &[String
     }
 }
 
+/// Pass 1 of the fused prep: QC metrics, cell keep mask, and per-gene
+/// detection counts among kept cells. One scan over CSR nonzeros.
+///
+/// Equivalent to `compute_qc_metrics` + `filter_cells_fixed` + the gene
+/// detection half of `filter_genes` on the cell-filtered matrix.
+pub fn qc_metrics_and_kept_gene_counts(
+    mat: &SpMat,
+    var_names: &[String],
+    obs_names: &[String],
+    min_genes: u32,
+    max_pct_mt: f32,
+) -> (QcMetrics, Vec<bool>, Vec<usize>) {
+    let n_cells = mat.rows();
+    let n_genes = mat.cols();
+
+    let is_mito: Vec<bool> = var_names
+        .iter()
+        .map(|g| g.starts_with("MT-") || g.starts_with("mt-"))
+        .collect();
+
+    let mut n_genes_by_counts = Vec::with_capacity(n_cells);
+    let mut total_counts = Vec::with_capacity(n_cells);
+    let mut pct_counts_mt = Vec::with_capacity(n_cells);
+    let mut keep = Vec::with_capacity(n_cells);
+    let mut gene_cell_counts = vec![0usize; n_genes];
+
+    for i in 0..n_cells {
+        let row = mat.outer_view(i).unwrap();
+        let mut n_genes_i = 0u32;
+        let mut total = 0.0f32;
+        let mut mito_total = 0.0f32;
+
+        for (col, &val) in row.iter() {
+            if val > 0.0 {
+                n_genes_i += 1;
+                total += val;
+                if is_mito[col] {
+                    mito_total += val;
+                }
+            }
+        }
+
+        let pct_mt = if total > 0.0 {
+            (mito_total / total) * 100.0
+        } else {
+            0.0
+        };
+        n_genes_by_counts.push(n_genes_i);
+        total_counts.push(total);
+        pct_counts_mt.push(pct_mt);
+
+        let keep_cell = n_genes_i >= min_genes && pct_mt <= max_pct_mt;
+        keep.push(keep_cell);
+        if keep_cell {
+            for (col, &val) in row.iter() {
+                if val > 0.0 {
+                    gene_cell_counts[col] += 1;
+                }
+            }
+        }
+    }
+
+    let metrics = QcMetrics {
+        barcodes: obs_names.to_vec(),
+        n_genes_by_counts,
+        total_counts,
+        pct_counts_mt,
+    };
+    (metrics, keep, gene_cell_counts)
+}
+
+/// Gene keep mask from per-gene detection counts (`count >= min_cells`).
+pub fn gene_keep_from_counts(gene_cell_counts: &[usize], min_cells: usize) -> Vec<bool> {
+    gene_cell_counts.iter().map(|&c| c >= min_cells).collect()
+}
+
 /// Filter cells based on fixed thresholds.
 ///
 /// Returns a boolean mask: `true` = keep cell.
@@ -208,7 +284,7 @@ mod tests {
 
     #[test]
     fn test_apply_cell_filter() {
-        let (mat, genes, cells) = toy_sc_matrix();
+        let (mat, _genes, cells) = toy_sc_matrix();
         let keep = vec![true, false, true, false];
         let (filtered, filtered_names) = apply_cell_filter(&mat, &cells, &keep);
 
@@ -226,5 +302,30 @@ mod tests {
         assert!(filtered.cols() < mat.cols());
         // MYC (index 3) should not be in kept
         assert!(!kept.contains(&3));
+    }
+
+    #[test]
+    fn test_qc_pass1_matches_sequential() {
+        let (mat, genes, cells) = toy_sc_matrix();
+        let sequential = compute_qc_metrics(&mat, &genes, &cells);
+        let keep_seq = filter_cells_fixed(&sequential, 3, 100.0);
+        let (filtered, _) = apply_cell_filter(&mat, &cells, &keep_seq);
+        let (_fg, kept_seq) = filter_genes(&filtered, 2);
+
+        let (fused_qc, keep, counts) =
+            qc_metrics_and_kept_gene_counts(&mat, &genes, &cells, 3, 100.0);
+        let keep_genes = gene_keep_from_counts(&counts, 2);
+        let kept_fused: Vec<usize> = keep_genes
+            .iter()
+            .enumerate()
+            .filter(|(_, &k)| k)
+            .map(|(i, _)| i)
+            .collect();
+
+        assert_eq!(fused_qc.n_genes_by_counts, sequential.n_genes_by_counts);
+        assert_eq!(fused_qc.total_counts, sequential.total_counts);
+        assert_eq!(fused_qc.pct_counts_mt, sequential.pct_counts_mt);
+        assert_eq!(keep, keep_seq);
+        assert_eq!(kept_fused, kept_seq);
     }
 }
