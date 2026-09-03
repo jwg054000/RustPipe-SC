@@ -93,6 +93,122 @@ pub fn cell_n_genes(mat: &SpMat) -> Vec<u32> {
         .collect()
 }
 
+/// Clamp PCA rank: `min(requested, n_cells-1, n_hvg)`, at least 1.
+pub fn clamp_n_pcs(requested: usize, n_cells: usize, n_hvg: usize) -> usize {
+    requested.min(n_cells.saturating_sub(1)).min(n_hvg).max(1)
+}
+
+/// Clipped z-score of implicit zeros for each gene (population scale).
+pub fn scaled_zero_z(means: &[f32], stds: &[f32], max_value: f32) -> Vec<f32> {
+    means
+        .iter()
+        .zip(stds.iter())
+        .map(|(&m, &s)| (-m / s).clamp(-max_value, max_value))
+        .collect()
+}
+
+/// Y = scale_clip(A) * Omega without materializing the dense scaled matrix.
+///
+/// `scale_clip` is Scanpy `sc.pp.scale`: (x - mean) / std, clipped to
+/// `[-max_value, max_value]`. Implicit zeros contribute `clip(-mean/std)`.
+pub fn spmm_scaled_clipped(
+    mat: &SpMat,
+    means: &[f32],
+    stds: &[f32],
+    max_value: f32,
+    omega: &Array2<f32>,
+) -> Array2<f32> {
+    let n_cells = mat.rows();
+    let n_genes = mat.cols();
+    let k = omega.ncols();
+    let z0 = scaled_zero_z(means, stds, max_value);
+
+    let correction: Vec<f32> = (0..k)
+        .map(|j| (0..n_genes).map(|g| z0[g] * omega[[g, j]]).sum())
+        .collect();
+
+    let mut y = Array2::<f32>::zeros((n_cells, k));
+    for i in 0..n_cells {
+        for j in 0..k {
+            y[[i, j]] = correction[j];
+        }
+        let row = mat.outer_view(i).unwrap();
+        for (g, &val) in row.iter() {
+            let z = ((val - means[g]) / stds[g]).clamp(-max_value, max_value);
+            let delta = z - z0[g];
+            if delta == 0.0 {
+                continue;
+            }
+            for j in 0..k {
+                y[[i, j]] += delta * omega[[g, j]];
+            }
+        }
+    }
+    y
+}
+
+/// Z = scale_clip(A)^T * Q without densifying.
+pub fn spmm_at_scaled_clipped(
+    mat: &SpMat,
+    means: &[f32],
+    stds: &[f32],
+    max_value: f32,
+    q: &Array2<f32>,
+) -> Array2<f32> {
+    let n_genes = mat.cols();
+    let n_cells = mat.rows();
+    let k = q.ncols();
+    let z0 = scaled_zero_z(means, stds, max_value);
+    let col_sums: Array1<f32> = q.sum_axis(Axis(0));
+
+    let mut z = Array2::<f32>::zeros((n_genes, k));
+    for g in 0..n_genes {
+        for j in 0..k {
+            z[[g, j]] = z0[g] * col_sums[j];
+        }
+    }
+
+    for i in 0..n_cells {
+        let row = mat.outer_view(i).unwrap();
+        for (g, &val) in row.iter() {
+            let zg = ((val - means[g]) / stds[g]).clamp(-max_value, max_value);
+            let delta = zg - z0[g];
+            if delta == 0.0 {
+                continue;
+            }
+            for j in 0..k {
+                z[[g, j]] += delta * q[[i, j]];
+            }
+        }
+    }
+    z
+}
+
+/// Frobenius norm squared of the scaled+clipped matrix, without densifying.
+pub fn scaled_clipped_frobenius_sq(
+    mat: &SpMat,
+    means: &[f32],
+    stds: &[f32],
+    max_value: f32,
+) -> f64 {
+    let n_cells = mat.rows();
+    let n_genes = mat.cols();
+    let z0 = scaled_zero_z(means, stds, max_value);
+    let mut total = 0.0f64;
+    for g in 0..n_genes {
+        total += n_cells as f64 * (z0[g] as f64) * (z0[g] as f64);
+    }
+    for i in 0..n_cells {
+        let row = mat.outer_view(i).unwrap();
+        for (g, &val) in row.iter() {
+            let z = ((val - means[g]) / stds[g]).clamp(-max_value, max_value);
+            let z0g = z0[g];
+            total += (z as f64) * (z as f64) - (z0g as f64) * (z0g as f64);
+        }
+    }
+    total.max(0.0)
+}
+
 /// Y = (A - mu) * Omega — sparse-dense matmul with implicit centering.
 ///
 /// Computes `A * Omega` (sparse x dense) then subtracts the rank-1 correction
@@ -346,6 +462,44 @@ mod tests {
 
         for i in 0..n_cells {
             for j in 0..k {
+                assert!(
+                    (y_sparse[[i, j]] - y_dense[[i, j]]).abs() < 1e-4,
+                    "mismatch at [{}, {}]: sparse={}, dense={}",
+                    i,
+                    j,
+                    y_sparse[[i, j]],
+                    y_dense[[i, j]]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_clamp_n_pcs() {
+        // Tiny post-QC matrix: 21 cells, 2000 HVG, request 50 → 20
+        assert_eq!(clamp_n_pcs(50, 21, 2000), 20);
+        // Rank limited by HVG count
+        assert_eq!(clamp_n_pcs(50, 21, 15), 15);
+        assert_eq!(clamp_n_pcs(50, 100, 40), 40);
+        assert_eq!(clamp_n_pcs(10, 100, 2000), 10);
+        assert_eq!(clamp_n_pcs(0, 21, 15), 1);
+        assert_eq!(clamp_n_pcs(50, 1, 100), 1);
+    }
+
+    #[test]
+    fn test_spmm_scaled_clipped_vs_dense() {
+        let mat = toy_matrix();
+        let (means, stds) = crate::scale::scale_stats(&mat);
+        let max_value = 10.0f32;
+        let omega =
+            Array2::from_shape_vec((4, 2), vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0]).unwrap();
+
+        let y_sparse = spmm_scaled_clipped(&mat, &means, &stds, max_value, &omega);
+        let (dense_scaled, _, _) = crate::scale::scale_sparse(&mat, max_value);
+        let y_dense = dense_scaled.dot(&omega);
+
+        for i in 0..3 {
+            for j in 0..2 {
                 assert!(
                     (y_sparse[[i, j]] - y_dense[[i, j]]).abs() < 1e-4,
                     "mismatch at [{}, {}]: sparse={}, dense={}",

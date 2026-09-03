@@ -87,18 +87,53 @@ pub fn select_hvg_sparse(
     }
 
     let start = std::time::Instant::now();
-
-    // Step 1: per-gene mean and variance from sparse data
     let (means, variances) = sparse::sparse_gene_stats(mat, n_cells);
+    let result = select_hvg_vst_from_stats(&means, &variances, var_names, n_top_genes, n_cells)?;
+    info!(
+        "Selected {} HVGs from {} genes in {:.3}s",
+        n_top_genes,
+        n_genes,
+        start.elapsed().as_secs_f64()
+    );
+    Ok(result)
+}
 
-    // Step 2: fit mean-variance trend
-    let (a, b) = fit_mean_variance_trend(&means, &variances);
+/// Seurat v3 VST ranking from precomputed per-gene mean/variance.
+///
+/// `n_cells` is the cell count used for the sqrt(n) clip (same as a matrix scan).
+pub fn select_hvg_vst_from_stats(
+    means: &[f32],
+    variances: &[f32],
+    var_names: &[String],
+    n_top_genes: usize,
+    n_cells: usize,
+) -> Result<HvgResult> {
+    let n_genes = means.len();
+    if variances.len() != n_genes || var_names.len() != n_genes {
+        bail!(
+            "means ({}), variances ({}), and var_names ({}) must have the same length",
+            n_genes,
+            variances.len(),
+            var_names.len()
+        );
+    }
+    if n_top_genes > n_genes {
+        bail!(
+            "n_top_genes ({}) exceeds total genes ({})",
+            n_top_genes,
+            n_genes
+        );
+    }
+    if n_cells < 2 {
+        bail!("Need at least 2 cells to compute variance");
+    }
+
+    let (a, b) = fit_mean_variance_trend(means, variances);
     info!(
         "HVG mean-variance trend: ln(var) = {:.4} + {:.4} * ln(mean)",
         a, b
     );
 
-    // Step 3: standardized variance with Seurat v3 clipping
     let clip_val = (n_cells as f32).sqrt();
     let variances_norm: Vec<f32> = means
         .par_iter()
@@ -113,14 +148,13 @@ pub fn select_hvg_sparse(
             }
             let sv = v / expected;
             if sv.is_finite() {
-                sv.min(clip_val) // Seurat v3 clipping!
+                sv.min(clip_val)
             } else {
                 0.0
             }
         })
         .collect();
 
-    // Step 4: rank by standardized variance (descending), take top N
     let mut ranked_indices: Vec<usize> = (0..n_genes).collect();
     ranked_indices.sort_by(|&a_idx, &b_idx| {
         variances_norm[b_idx]
@@ -128,8 +162,6 @@ pub fn select_hvg_sparse(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     ranked_indices.truncate(n_top_genes);
-
-    // Sort for stable ordering
     ranked_indices.sort();
 
     let selected_names: Vec<String> = ranked_indices
@@ -137,18 +169,11 @@ pub fn select_hvg_sparse(
         .map(|&i| var_names[i].clone())
         .collect();
 
-    info!(
-        "Selected {} HVGs from {} genes in {:.3}s",
-        n_top_genes,
-        n_genes,
-        start.elapsed().as_secs_f64()
-    );
-
     Ok(HvgResult {
         gene_names: selected_names,
         gene_indices: ranked_indices,
-        means,
-        variances,
+        means: means.to_vec(),
+        variances: variances.to_vec(),
         variances_norm,
     })
 }
@@ -184,9 +209,42 @@ pub fn select_hvg_seurat(
     }
 
     let start = std::time::Instant::now();
-
-    // Step 1: per-gene mean and variance from sparse data
     let (means, variances) = sparse::sparse_gene_stats(mat, n_cells);
+    let result = select_hvg_seurat_from_stats(&means, &variances, var_names, n_top_genes, n_bins)?;
+    info!(
+        "Selected {} HVGs (seurat flavor, {} bins) from {} genes in {:.3}s",
+        n_top_genes,
+        n_bins,
+        n_genes,
+        start.elapsed().as_secs_f64()
+    );
+    Ok(result)
+}
+
+/// Seurat dispersion-bin ranking from precomputed per-gene mean/variance.
+pub fn select_hvg_seurat_from_stats(
+    means: &[f32],
+    variances: &[f32],
+    var_names: &[String],
+    n_top_genes: usize,
+    n_bins: usize,
+) -> Result<HvgResult> {
+    let n_genes = means.len();
+    if variances.len() != n_genes || var_names.len() != n_genes {
+        bail!(
+            "means ({}), variances ({}), and var_names ({}) must have the same length",
+            n_genes,
+            variances.len(),
+            var_names.len()
+        );
+    }
+    if n_top_genes > n_genes {
+        bail!(
+            "n_top_genes ({}) exceeds total genes ({})",
+            n_top_genes,
+            n_genes
+        );
+    }
 
     // Step 2: dispersion = var / mean (Scanpy: mean_zero → 1e-12, disp_zero → NaN)
     let dispersions: Vec<f64> = means
@@ -337,19 +395,11 @@ pub fn select_hvg_seurat(
 
     let selected_names: Vec<String> = ranked.iter().map(|&i| var_names[i].clone()).collect();
 
-    info!(
-        "Selected {} HVGs (seurat flavor, {} bins) from {} genes in {:.3}s",
-        n_top_genes,
-        n_bins,
-        n_genes,
-        start.elapsed().as_secs_f64()
-    );
-
     Ok(HvgResult {
         gene_names: selected_names,
         gene_indices: ranked,
-        means,
-        variances,
+        means: means.to_vec(),
+        variances: variances.to_vec(),
         variances_norm: disp_norm,
     })
 }

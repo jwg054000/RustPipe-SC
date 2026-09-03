@@ -582,10 +582,7 @@ pub fn run_pca_sparse(
     let total_t0 = Instant::now();
     let n_cells = mat.rows();
     let n_genes = mat.cols();
-    let n_components = n_components
-        .min(n_cells.saturating_sub(1))
-        .min(n_genes.saturating_sub(1))
-        .max(1);
+    let n_components = crate::sparse::clamp_n_pcs(n_components, n_cells, n_genes);
     let k = (n_components + oversampling).min(n_genes).min(n_cells);
 
     eprintln!(
@@ -740,10 +737,7 @@ pub fn run_pca_scaled(
     let total_t0 = Instant::now();
     let n_cells = scaled.nrows();
     let n_genes = scaled.ncols();
-    let n_components = n_components
-        .min(n_cells.saturating_sub(1))
-        .min(n_genes.saturating_sub(1))
-        .max(1);
+    let n_components = crate::sparse::clamp_n_pcs(n_components, n_cells, n_genes);
     let k = (n_components + oversampling).min(n_genes).min(n_cells);
 
     eprintln!(
@@ -832,6 +826,119 @@ pub fn run_pca_scaled(
     eprintln!("[pca-scaled] total: {:.1}ms", total_ms);
     eprintln!(
         "[pca-scaled] variance captured: {:.2}%",
+        var_explained.iter().sum::<f64>() * 100.0
+    );
+
+    PcaResult {
+        pc_scores,
+        variance_explained: var_explained,
+        selected_genes: gene_names.to_vec(),
+        timings: PcaTimings {
+            variance_calc_ms: 0.0,
+            gene_selection_ms: 0.0,
+            centering_ms: 0.0,
+            svd_ms,
+            total_ms,
+        },
+    }
+}
+
+/// Randomized SVD on a sparse HVG matrix with implicit scale+clip+center.
+///
+/// Same power-iteration Halko–Martinsson–Tropp scheme as `run_pca_scaled`,
+/// but never densifies the HVG matrix. Scaling matches `scale::scale_sparse`.
+pub fn run_pca_sparse_scaled(
+    mat: &crate::sparse::SpMat,
+    means: &[f32],
+    stds: &[f32],
+    max_value: f32,
+    gene_names: &[String],
+    n_components: usize,
+    n_power_iter: usize,
+    oversampling: usize,
+    seed: u64,
+) -> PcaResult {
+    use crate::sparse::{
+        clamp_n_pcs, scaled_clipped_frobenius_sq, spmm_at_scaled_clipped, spmm_scaled_clipped,
+    };
+    use ndarray::Array2;
+    use rand::SeedableRng;
+    use rand_distr::StandardNormal;
+
+    let total_t0 = Instant::now();
+    let n_cells = mat.rows();
+    let n_genes = mat.cols();
+    let n_components = clamp_n_pcs(n_components, n_cells, n_genes);
+    let k = (n_components + oversampling).min(n_genes).min(n_cells);
+
+    eprintln!(
+        "[pca-sparse] {}x{} HVG, {} components, {} power iterations (implicit scale+clip)",
+        n_cells, n_genes, n_components, n_power_iter
+    );
+
+    let svd_t0 = Instant::now();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let omega = Array2::from_shape_fn((n_genes, k), |_| {
+        use rand::Rng;
+        rng.sample::<f32, _>(StandardNormal)
+    });
+
+    let mut y = spmm_scaled_clipped(mat, means, stds, max_value, &omega);
+
+    for _iter in 0..n_power_iter {
+        let (q_flat, _) = qr_mgs_f32(&y);
+        let q = Array2::from_shape_vec((n_cells, k), q_flat).unwrap();
+        let z = spmm_at_scaled_clipped(mat, means, stds, max_value, &q);
+        let (z_q_flat, _) = qr_mgs_f32(&z);
+        let z_q = Array2::from_shape_vec((n_genes, k), z_q_flat).unwrap();
+        y = spmm_scaled_clipped(mat, means, stds, max_value, &z_q);
+    }
+
+    let (q_flat, _) = qr_mgs_f32(&y);
+    let q = Array2::from_shape_vec((n_cells, k), q_flat).unwrap();
+    let b_t = spmm_at_scaled_clipped(mat, means, stds, max_value, &q);
+
+    let k_actual = k.min(n_genes).min(n_cells);
+    let n_components = n_components.min(k_actual).max(1);
+    let mut b_flat = vec![0.0f64; k_actual * n_genes];
+    for i in 0..k_actual {
+        for j in 0..n_genes {
+            b_flat[i * n_genes + j] = b_t[[j, i]] as f64;
+        }
+    }
+
+    let (u_b, sigma, _vt) = small_svd(&b_flat, k_actual, n_genes);
+
+    let mut pc_scores: Vec<Vec<f64>> = Vec::with_capacity(n_cells);
+    for c in 0..n_cells {
+        let mut row = Vec::with_capacity(n_components);
+        for pc in 0..n_components {
+            let mut dot = 0.0f64;
+            for j in 0..k_actual {
+                dot += q[[c, j]] as f64 * u_b[j * k_actual + pc];
+            }
+            row.push(dot * sigma[pc]);
+        }
+        pc_scores.push(row);
+    }
+
+    let total_var = scaled_clipped_frobenius_sq(mat, means, stds, max_value);
+    let var_explained: Vec<f64> = if total_var > 0.0 {
+        sigma[..n_components]
+            .iter()
+            .map(|s| (s * s) / total_var)
+            .collect()
+    } else {
+        vec![0.0; n_components]
+    };
+
+    let svd_ms = svd_t0.elapsed().as_secs_f64() * 1000.0;
+    let total_ms = total_t0.elapsed().as_secs_f64() * 1000.0;
+
+    eprintln!("[pca-sparse] SVD: {:.1}ms", svd_ms);
+    eprintln!("[pca-sparse] total: {:.1}ms", total_ms);
+    eprintln!(
+        "[pca-sparse] variance captured: {:.2}%",
         var_explained.iter().sum::<f64>() * 100.0
     );
 
@@ -981,5 +1088,63 @@ mod tests {
         let (_, sigma, _) = small_svd(&b, 2, 2);
         assert!((sigma[0] - 3.0).abs() < 1e-8, "sigma[0] = {}", sigma[0]);
         assert!(sigma[1].abs() < 1e-8, "sigma[1] = {}", sigma[1]);
+    }
+
+    #[test]
+    fn n_pcs_clamp_tiny_post_qc_does_not_panic() {
+        // Locally seen: 21 cells remaining after tight QC, default n_pcs=50.
+        let n_cells = 21;
+        let n_hvg = 15;
+        let mut rows = Vec::new();
+        let mut cols = Vec::new();
+        let mut vals = Vec::new();
+        for c in 0..n_cells {
+            for g in 0..n_hvg {
+                let v = ((c * 3 + g * 5) % 11) as f32 + 1.0;
+                rows.push(c);
+                cols.push(g);
+                vals.push(v);
+            }
+        }
+        let mat = crate::sparse::from_triplets(n_cells, n_hvg, &rows, &cols, &vals);
+        let names: Vec<String> = (0..n_hvg).map(|g| format!("G{g}")).collect();
+        let (means, stds) = crate::scale::scale_stats(&mat);
+        let res = run_pca_sparse_scaled(&mat, &means, &stds, 10.0, &names, 50, 2, 4, 42);
+        assert_eq!(res.pc_scores.len(), n_cells);
+        assert_eq!(
+            res.pc_scores[0].len(),
+            crate::sparse::clamp_n_pcs(50, n_cells, n_hvg)
+        );
+        assert_eq!(res.variance_explained.len(), 15);
+    }
+
+    #[test]
+    fn sparse_scaled_pca_matches_dense_scaled() {
+        let mat = crate::sparse::from_triplets(
+            8,
+            6,
+            &[0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7],
+            &[0, 2, 1, 3, 0, 4, 1, 5, 2, 3, 0, 5, 1, 4, 2, 5],
+            &[
+                4.0, 1.0, 3.0, 2.0, 5.0, 1.0, 2.0, 4.0, 3.0, 1.0, 6.0, 2.0, 1.0, 3.0, 2.0, 5.0,
+            ],
+        );
+        let names: Vec<String> = (0..6).map(|g| format!("G{g}")).collect();
+        let (means, stds) = crate::scale::scale_stats(&mat);
+        let (dense, _, _) = crate::scale::scale_sparse(&mat, 10.0);
+        let sparse_res = run_pca_sparse_scaled(&mat, &means, &stds, 10.0, &names, 3, 2, 2, 7);
+        let dense_res = run_pca_scaled(&dense, &names, 3, 2, 2, 7);
+        assert_eq!(sparse_res.pc_scores.len(), dense_res.pc_scores.len());
+        for (i, (a, b)) in sparse_res
+            .pc_scores
+            .iter()
+            .zip(dense_res.pc_scores.iter())
+            .enumerate()
+        {
+            assert_eq!(a.len(), b.len());
+            for (j, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                assert!((x - y).abs() < 1e-3, "PC[{i},{j}] sparse={x} dense={y}");
+            }
+        }
     }
 }
